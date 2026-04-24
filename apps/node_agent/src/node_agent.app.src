@@ -1,0 +1,17 @@
+{application, node_agent,
+ [{description, "Mycelium Node Agent: owns and supervises workloads on a host."},
+  {vsn, "0.1.0"},
+  {registered, [node_agent_sup,
+                node_agent_registry,
+                node_agent_scheduler_stub,
+                node_agent_task_sup,
+                node_agent_ctrd_sup]},
+  {mod, {node_agent_app, []}},
+  {applications, [kernel, stdlib, mycelium_proto]},
+  {env, [{ctrd_mod, node_agent_ctrd_real},
+         {ctrd_namespace, <<"mycelium">>},
+         {helper_binary, "./helpers/ctrd_helper/ctrd_helper"}]},
+  {modules, []},
+  {licenses, ["Apache-2.0"]},
+  {links, []}
+ ]}.
