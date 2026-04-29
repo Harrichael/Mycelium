@@ -26,7 +26,7 @@ all() ->
      {group, lifecycle}].
 
 groups() ->
-    [{protocol, [sequence], [protocol_ping]},
+    [{protocol, [sequence], [protocol_ping, protocol_concurrent_ops]},
      {lifecycle, [sequence], [lifecycle_start_exit]}].
 
 init_per_suite(Config) -> Config.
@@ -64,6 +64,26 @@ protocol_ping(_Config) ->
     {ok, #{<<"type">> := <<"ack">>, <<"op">> := <<"ping">>}} =
         node_agent_helper_port:send_op(#{op => ping}).
 
+%% Fires N concurrent sends. Only the first hits the pending-undefined
+%% branch; the rest must traverse the queue path and still complete.
+%% Caveat: pings are indistinguishable, so this asserts only "queue
+%% does not drop or deadlock." Asserting strict FIFO requires F1
+%% (wire-level op correlation) in issues.txt — T1 and F1 land together.
+protocol_concurrent_ops(_Config) ->
+    Self = self(),
+    N = 20,
+    _ = [spawn(fun() ->
+        R = node_agent_helper_port:send_op(#{op => ping}),
+        Self ! {done, R}
+    end) || _ <- lists:seq(1, N)],
+    Results = [receive {done, R} -> R after 5_000 -> error(send_op_timeout) end
+               || _ <- lists:seq(1, N)],
+    ?assertEqual(N, length(Results)),
+    lists:foreach(
+      fun(R) -> ?assertMatch({ok, #{<<"type">> := <<"ack">>,
+                                    <<"op">>   := <<"ping">>}}, R) end,
+      Results).
+
 %% --- lifecycle tier --------------------------------------------------
 
 lifecycle_start_exit(_Config) ->
@@ -79,7 +99,7 @@ lifecycle_start_exit(_Config) ->
     end,
     H = [E || {TaskId, E} <- node_agent_scheduler_stub:history(), TaskId =:= Id],
     ?assert(lists:any(fun({started, _}) -> true; (_) -> false end, H)),
-    ?assert(lists:any(fun({exited, _}) -> true; (_) -> false end, H)).
+    ?assert(lists:any(fun({exited, #{code := 0}}) -> true; (_) -> false end, H)).
 
 %% --- helpers ---------------------------------------------------------
 

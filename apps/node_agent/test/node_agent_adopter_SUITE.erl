@@ -15,7 +15,8 @@ all() ->
      skips_unadoptable_items,
      init_retry_succeeds_after_transient_failures,
      buffered_event_delivered_on_subscribe,
-     sticky_terminal_eviction_preserves_exit].
+     sticky_terminal_eviction_preserves_exit,
+     rest_for_one_reruns_adoption_after_ctrd_crash].
 
 init_per_suite(Config) -> Config.
 end_per_suite(_Config) -> ok.
@@ -183,3 +184,43 @@ count_events(St, Ex) ->
         {ctrd_event, _, _}            -> count_events(St, Ex)
     after 200 -> {St, Ex}
     end.
+
+%% Verifies node_agent_sup's rest_for_one cascade: killing the ctrd
+%% sub-supervisor must restart task_sup (flushing existing task gen_
+%% servers) and adopter (re-running against the re-initialized fake).
+%% The fake picks up its preload from persistent_term on restart, so the
+%% post-cascade adopter re-registers the same Id — but to a new pid.
+%% exit(_, kill) is brutal deliberately — normal exit wouldn't trigger
+%% rest_for_one, so we need an abnormal exit to drive the cascade.
+rest_for_one_reruns_adoption_after_ctrd_crash(_Config) ->
+    S = spec(<<"re-adopt">>),
+    preload([#{id => <<"re-adopt">>, status => running, spec => S}]),
+    {ok, _} = application:ensure_all_started(node_agent),
+    wait_adopter_done(),
+    {ok, TaskPid1} = node_agent_registry:whereis(<<"re-adopt">>),
+
+    CtrdSup = erlang:whereis(node_agent_ctrd_sup),
+    ?assert(is_pid(CtrdSup)),
+    MRef = erlang:monitor(process, CtrdSup),
+    exit(CtrdSup, kill),
+    receive {'DOWN', MRef, process, CtrdSup, _} -> ok
+    after 5_000 -> error(ctrd_sup_did_not_die)
+    end,
+
+    %% Wait until the registry swaps in a new pid for the same Id — the
+    %% strongest signal that the full cascade (ctrd_sup -> task_sup ->
+    %% adopter) has completed and the adopter re-ran.
+    ok = retry(200, fun() ->
+        case node_agent_registry:whereis(<<"re-adopt">>) of
+            {ok, P} when P =/= TaskPid1 -> ok;
+            _ -> again
+        end
+    end),
+    {ok, TaskPid2} = node_agent_registry:whereis(<<"re-adopt">>),
+    ?assertNotEqual(TaskPid1, TaskPid2),
+    %% Fake's call log is post-cascade only (it restarted with the rest).
+    %% list/0 must appear (adopter ran) and no create/0 (running status
+    %% means adopt, not create).
+    Calls = node_agent_ctrd_fake:calls(),
+    ?assert(lists:any(fun({list, _}) -> true; (_) -> false end, Calls)),
+    ?assertEqual([], [A || {create, A} <- Calls]).

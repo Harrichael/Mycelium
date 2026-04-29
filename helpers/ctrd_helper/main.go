@@ -14,6 +14,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -108,7 +109,13 @@ func handle(out *json.Encoder, req request) {
 		write(out, response{Type: "ack", Op: "kill", ID: req.ID})
 
 	case "delete":
-		_ = runCtr(req.Namespace, "containers", "delete", req.ID)
+		// Reap any lingering task before removing the container —
+		// containerd rejects container deletion while a task is still
+		// attached (common after adopter picks up a stopped task that
+		// was never reaped by watchExit). Both calls are best-effort;
+		// "not found" just means already gone.
+		_ = runCtrQuiet(req.Namespace, "tasks", "delete", req.ID)
+		_ = runCtrQuiet(req.Namespace, "containers", "delete", req.ID)
 		write(out, response{Type: "ack", Op: "delete", ID: req.ID})
 
 	case "list":
@@ -265,7 +272,10 @@ func watchExit(out *json.Encoder, ns, id string) {
 		if status == "running" {
 			continue
 		}
-		code := taskExitCode(ns, id)
+		// Reap the task: this simultaneously (a) releases containerd's
+		// hold so the container can be recreated on restart, and
+		// (b) surfaces the task's exit status as ctr's own exit code.
+		code := reapTaskExitCode(ns, id)
 		r := response{
 			Type:     "event",
 			Kind:     "task_exit",
@@ -278,22 +288,32 @@ func watchExit(out *json.Encoder, ns, id string) {
 	}
 }
 
-func taskExitCode(ns, id string) int {
-	out, err := runCtrOut(ns, "tasks", "list")
-	if err != nil {
-		return -1
+// reapTaskExitCode deletes the task and returns its exit code.
+//
+// `ctr tasks delete` terminates with an exit status equal to the task's
+// own exit status (containerd source: cmd/ctr/commands/tasks/delete.go).
+// We rely on that: Go's exec.ExitError.ExitCode() gives us the task's
+// exit code directly. When the delete itself fails (e.g. task already
+// reaped by another call), ctr also exits non-zero, so we disambiguate
+// via stderr and treat "not found" as a clean (already-reaped) exit.
+func reapTaskExitCode(ns, id string) int {
+	cmd := exec.Command("ctr", "-n", ns, "tasks", "delete", id)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err == nil {
+		return 0
 	}
-	for _, line := range strings.Split(out, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 3 && fields[0] == id {
-			// `ctr tasks list` output: TASK PID STATUS
-			// Exit code isn't directly in that; we'd need `ctr tasks delete`
-			// to fetch. For v1, report 0 if stopped cleanly, 137 otherwise.
-			// This is a known imprecision for the shell-out strategy.
+	se := stderr.String()
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		if strings.Contains(se, "not found") || strings.Contains(se, "NotFound") {
 			return 0
 		}
+		_, _ = os.Stderr.WriteString(se)
+		return exitErr.ExitCode()
 	}
-	return 0
+	_, _ = os.Stderr.WriteString(se)
+	return -1
 }
 
 func runCtr(ns string, args ...string) error {
@@ -308,4 +328,12 @@ func runCtrOut(ns string, args ...string) (string, error) {
 	cmd := exec.Command("ctr", a...)
 	out, err := cmd.Output()
 	return string(out), err
+}
+
+// runCtrQuiet runs ctr without forwarding stderr. For best-effort calls
+// where "not found" and similar conditions are expected and noisy.
+func runCtrQuiet(ns string, args ...string) error {
+	a := append([]string{"-n", ns}, args...)
+	cmd := exec.Command("ctr", a...)
+	return cmd.Run()
 }

@@ -1,0 +1,174 @@
+Mycelium — known issues and test gaps
+======================================
+
+Resolved in the commit that introduced this file
+-------------------------------------------------
+
+  * ctrd_helper: taskExitCode stub replaced with reapTaskExitCode, which
+    deletes the task and reports its actual exit status (ctr tasks
+    delete's own exit code). Fixes silent misclassification of crashes
+    as clean exits, which had defeated on_failure restart policy.
+  * ctrd_helper: `delete` op now reaps any lingering task before deleting
+    the container, so adopter-picked-up stopped containers can be
+    recreated on restart.
+  * lifecycle_start_exit: now asserts exited event's code field (code=0
+    for the clean-exit case), validating the reap path end-to-end.
+  * Added: node_agent_json_SUITE (round-trip encode/decode coverage).
+  * Added: node_agent_ctrd_real_SUITE:protocol_concurrent_ops (helper-
+    port queue smoke test).
+  * Added: node_agent_adopter_SUITE:rest_for_one_reruns_adoption_after_
+    ctrd_crash (verifies the cascade choreography).
+
+
+Priority
+========
+
+Must-fix before next lifecycle run under load
+---------------------------------------------
+
+  * F11 — ctrd_helper json.Encoder is shared across goroutines without
+    synchronization. Real bug, not theoretical: the main request loop
+    and every watchExit goroutine all call write(out, ...); two
+    overlapping Encode calls can interleave bytes inside a single Write
+    and one byte of interleave corrupts a protocol line. Fix is ~5
+    lines: wrap write in a sync.Mutex (or serialize via a single writer
+    goroutine). Current tests don't expose it — protocol_concurrent_ops
+    only exercises the main request loop, not the event path.
+  * F4 — ctrd_{real,fake} subscribe buffer is never cleared after
+    drain. Narrow impact today because task gen_servers are temporary
+    (no auto-restart), but any future re-registration path for the
+    same Id — operator-triggered recreate, restart-via-supervisor,
+    anything — will silently replay the predecessor's terminal event
+    and trigger spurious restart cycles. Fix: maps:remove(Id, Buffers)
+    after drain in both node_agent_ctrd_real and node_agent_ctrd_fake.
+
+Defer to M2 (when the sequential-op constraint is lifted)
+---------------------------------------------------------
+
+  * F1 — wire-level op correlation. Current safety rests on two halves:
+    (a) the helper is strictly serial and (b) the Erlang mailbox is
+    FIFO. Both halves are cross-layer; once (a) no longer holds, the
+    invariant must move into the protocol (op_id stamped by Erlang,
+    echoed by Go). Do not ship this before the sequential constraint
+    is actually relaxed — premature complexity.
+  * T1 — FIFO ordering of helper-port queue. Can only meaningfully be
+    asserted once F1 gives us distinguishable ops. Blocked on F1;
+    land them together.
+
+
+Functional issues
+=================
+
+F1. helper_port: no wire-level correlation between ops and acks.
+    node_agent_helper_port:complete_pending/2 pairs responses with the
+    head of `pending` by position, not by id. Safe today on the
+    two-halves argument above. The `Ref` bound in handle_call is
+    decorative — either delete or wire through as the op_id. See
+    Priority section above for timing.
+
+F2. node_agent:drain/1 worker can hang parent on unexpected crash.
+    Worker spawned at node_agent.erl:61 may crash before sending
+    {drain_done, Ref}, leaving parent blocked in await_drain. Cheap to
+    fix. Preferred approach: have the parent monitor the worker
+    directly — one mechanism covers both unexpected-crash and
+    unexpected-exit, no need for try...after around the worker body.
+
+F3. node_agent_task_sup uses shutdown => brutal_kill.
+    Harmless today (terminate/2 is empty), but once terminate/2 grows
+    (final event emission, resource release) application:stop will skip
+    it. Prefer a finite shutdown (e.g. stop_timeout_ms + small buffer).
+
+F4. ctrd_{real,fake} subscribe: buffer never cleared after drain.
+    See Priority section above — must-fix before next lifecycle run
+    under load.
+
+F5. node_agent_json: encoder does not sort map keys. Low priority.
+    In OTP 24, maps with ≤32 entries iterate in insertion order and no
+    current emitted shape crosses that threshold. Latent risk becomes
+    real once we have a wire-bytes consumer (byte-level diffs, content
+    hashes, etc.) or a map value crosses 32 entries. Revisit then.
+
+F6. node_agent_json: \u surrogate escapes throw badarg.
+    parse_string matches \uXXXX and constructs <<CP/utf8>>. For lone
+    surrogates (0xD800-0xDFFF) this raises error:badarg, escaping the
+    throw-catch and returning an error the caller does not expect.
+    Either reject surrogates explicitly with {error, _} or handle the
+    paired form and convert to a real code point.
+
+F7. ctrd_real spec_label: unbounded container label size.
+    base64 of JSON-encoded spec stored as a container label. containerd
+    labels have size limits; large specs (many env vars, long cmd) can
+    exceed them. Add a size check on encode, or move spec storage off
+    the label (local KV, boltdb, etc).
+
+F8. ctrd_helper watchExit: polls via ctr forks; not scalable.
+    Every 200ms per running task we fork `ctr tasks list`. N tasks at
+    scale is 5N forks/s. Acceptable for dev; v2 should subscribe to
+    containerd's events API (the wire shape from helper to Erlang
+    does not need to change).
+
+F9. mycelium_proto:validate_task_spec: no shape check for cpu_max or
+    mem_max. In-process callers today are controlled, so this is low
+    risk now; becomes important as soon as any external surface (e.g.
+    scheduler RPC) can deliver a spec.
+
+F10. ctrd_helper kill escalation: SIGKILL promotion is silent.
+     When SIGTERM's deadline expires and doKill escalates to SIGKILL,
+     Erlang sees an ack identical to a clean stop. No signal in the
+     history or logs. Add a field in the ack indicating escalation, or
+     emit a side-channel event.
+
+F11. ctrd_helper: json.Encoder shared across goroutines without sync.
+     See Priority section above — must-fix before next lifecycle run
+     under load.
+
+F12. reapTaskExitCode fallback to -1 is semantically ambiguous.
+     When ctr fails in a way that isn't *exec.ExitError (spawn failure,
+     signal, etc.), reapTaskExitCode returns -1. Erlang surfaces this
+     as {exited, #{code => -1}}. Under on_failure this behaves
+     correctly by accident (non-zero → restart), but -1 means "we
+     don't know the exit code," not "exit code is -1." Surface as a
+     distinct event kind (e.g. task_exit_unknown) so policy and logs
+     can distinguish "crashed with code X" from "we lost track of it."
+
+
+Test gaps
+=========
+
+T1. helper_port FIFO ordering is not asserted.
+    See Priority / Defer section above — blocked on F1.
+
+T2. Restart delete-before-create ordering is only partially covered.
+    node_agent_task_SUITE:on_failure_then_permanent asserts 3 create
+    calls across 2 restarts but does not assert a delete precedes each
+    create. Add an interleaved-call-log check.
+
+T3. Mid-call event delivery is tested only structurally.
+    Replay-on-subscribe is covered via the buffered_event_delivered_on_
+    subscribe test. The specific "event arrives while subscriber is
+    inside create/1" deadlock-avoidance scenario is not staged. A fake
+    extension that injects from within a call handler would demonstrate
+    the subscriber does not block.
+
+T4. node_agent_registry: {error, already_registered} branch untested.
+    DOWN-cleanup is covered indirectly by stop_watchdog_fires_when_no_
+    exit. Concurrent register contention is not.
+
+T5. node_agent:drain/0,1: zero coverage.
+    Both the happy-path and the worker-crash hang (F2) are untested.
+
+T6. Adopter retry exhaustion is untested.
+    init_retry_succeeds_after_transient_failures covers the success
+    path. All 5 backoffs failing -> return {list_failed, _} -> sup
+    intensity trip is untested.
+
+T7. lifecycle tier: only clean-exit case exists.
+    lifecycle_start_exit now asserts code=0 after the helper fix. Add a
+    counterpart that exits non-zero (e.g. `sh -c 'exit 7'`) to verify
+    the reap path surfaces non-zero codes.
+
+T8. ctrd_helper has no Go-side unit tests.
+    JSON framing, argument assembly, and the reap path are only
+    exercised via the integration tier (CTRD_INTEGRATION=1). Pure Go
+    unit tests against a mocked exec would cover the parsing and
+    error-disambiguation logic without needing containerd.
